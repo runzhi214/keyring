@@ -2,4 +2,7 @@ module github.com/runzhi214/keyring
 
 go 1.23
 
-require golang.org/x/sys v0.22.0 // indirect
+require (
+	github.com/godbus/dbus/v5 v5.2.2 // indirect
+	golang.org/x/sys v0.27.0 // indirect
+)
