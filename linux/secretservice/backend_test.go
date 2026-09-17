@@ -113,6 +113,22 @@ func TestListFindsMultipleKeys(t *testing.T) {
 	}
 }
 
+func TestHandlePromptNoOp(t *testing.T) {
+	b := New()
+	if !b.Available().OK {
+		t.Skipf("Secret Service not available")
+	}
+	if err := b.client.ensureInit(); err != nil {
+		t.Fatalf("ensureInit: %v", err)
+	}
+	ctx := context.Background()
+	// promptPath="/" means no prompt needed — should return nil immediately.
+	err := b.client.handlePrompt(ctx, "/", "test-svc", "test-key")
+	if err != nil {
+		t.Errorf("handlePrompt with '/' path: got %v, want nil", err)
+	}
+}
+
 func TestUpdatePreservesCreated(t *testing.T) {
 	b := New()
 	if !b.Available().OK {

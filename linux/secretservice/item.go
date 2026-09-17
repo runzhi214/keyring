@@ -34,7 +34,7 @@ func (c *Client) getSecret(ctx context.Context, itemPath dbus.ObjectPath) (*ssSe
 // createItem creates a new item in the collection with the given label,
 // attributes, and secret value. When replace is true, any existing item
 // with the same attributes is replaced.
-func (c *Client) createItem(ctx context.Context, collectionPath dbus.ObjectPath, label string, attrs map[string]string, value string) error {
+func (c *Client) createItem(ctx context.Context, collectionPath dbus.ObjectPath, label string, attrs map[string]string, value string, service, key string) error {
 	secret := ssSecret{
 		Session:     c.session,
 		Parameters:  []byte{},
@@ -52,74 +52,67 @@ func (c *Client) createItem(ctx context.Context, collectionPath dbus.ObjectPath,
 	if err := obj.CallWithContext(ctx, collectionIface+".CreateItem", 0, properties, secret, true).Store(&itemPath, &promptPath); err != nil {
 		return fmt.Errorf("create item: %w", err)
 	}
-	if err := c.handlePrompt(ctx, promptPath); err != nil {
+	if err := c.handlePrompt(ctx, promptPath, service, key); err != nil {
 		return err
 	}
 	return nil
 }
 
 // deleteItem removes an item from its collection.
-func (c *Client) deleteItem(ctx context.Context, itemPath dbus.ObjectPath) error {
+func (c *Client) deleteItem(ctx context.Context, itemPath dbus.ObjectPath, service, key string) error {
 	var promptPath dbus.ObjectPath
 	if err := c.connObject(itemPath).CallWithContext(ctx, itemIface+".Delete", 0).Store(&promptPath); err != nil {
 		return fmt.Errorf("delete item: %w", err)
 	}
-	if err := c.handlePrompt(ctx, promptPath); err != nil {
+	if err := c.handlePrompt(ctx, promptPath, service, key); err != nil {
 		return err
 	}
 	return nil
 }
 
-// getItemLabel reads the Label property of an item.
-func (c *Client) getItemLabel(itemPath dbus.ObjectPath) (string, error) {
-	prop, err := c.connObject(itemPath).GetProperty(itemIface + ".Label")
-	if err != nil {
-		return "", err
-	}
-	label, ok := prop.Value().(string)
-	if !ok {
-		return "", fmt.Errorf("Label is %T, want string", prop.Value())
-	}
-	return label, nil
+// itemMetadata holds the metadata read from an item's properties.
+type itemMetadata struct {
+	Label      string
+	Attributes map[string]string
+	Created    time.Time
+	Modified   time.Time
 }
 
-// getItemAttributes reads the Attributes property of an item.
-func (c *Client) getItemAttributes(itemPath dbus.ObjectPath) (map[string]string, error) {
-	prop, err := c.connObject(itemPath).GetProperty(itemIface + ".Attributes")
-	if err != nil {
-		return nil, err
+// getItemMetadata reads all item properties in a single D-Bus call
+// (GetAll) instead of individual GetProperty calls. This reduces the
+// number of D-Bus round-trips from 4 to 1 per Get operation.
+func (c *Client) getItemMetadata(itemPath dbus.ObjectPath) (*itemMetadata, error) {
+	var props map[string]dbus.Variant
+	if err := c.connObject(itemPath).Call(
+		"org.freedesktop.DBus.Properties.GetAll", 0, itemIface,
+	).Store(&props); err != nil {
+		return nil, fmt.Errorf("read item properties: %w", err)
 	}
-	attrs, ok := prop.Value().(map[string]string)
-	if !ok {
-		return nil, fmt.Errorf("Attributes is %T, want map[string]string", prop.Value())
-	}
-	return attrs, nil
-}
 
-// getItemCreated reads the Created property (Unix timestamp) of an item.
-func (c *Client) getItemCreated(itemPath dbus.ObjectPath) (time.Time, error) {
-	prop, err := c.connObject(itemPath).GetProperty(itemIface + ".Created")
-	if err != nil {
-		return time.Time{}, err
-	}
-	ts, ok := prop.Value().(uint64)
-	if !ok {
-		return time.Time{}, fmt.Errorf("Created is %T, want uint64", prop.Value())
-	}
-	return time.Unix(int64(ts), 0), nil
-}
+	meta := &itemMetadata{}
 
-// getItemModified reads the Modified property (Unix timestamp) of an item.
-func (c *Client) getItemModified(itemPath dbus.ObjectPath) (time.Time, error) {
-	prop, err := c.connObject(itemPath).GetProperty(itemIface + ".Modified")
-	if err != nil {
-		return time.Time{}, err
+	if v, ok := props["Label"]; ok {
+		if label, ok := v.Value().(string); ok {
+			meta.Label = label
+		}
 	}
-	ts, ok := prop.Value().(uint64)
-	if !ok {
-		return time.Time{}, fmt.Errorf("Modified is %T, want uint64", prop.Value())
+	if v, ok := props["Attributes"]; ok {
+		if attrs, ok := v.Value().(map[string]string); ok {
+			meta.Attributes = attrs
+		}
 	}
-	return time.Unix(int64(ts), 0), nil
+	if v, ok := props["Created"]; ok {
+		if ts, ok := v.Value().(uint64); ok {
+			meta.Created = time.Unix(int64(ts), 0)
+		}
+	}
+	if v, ok := props["Modified"]; ok {
+		if ts, ok := v.Value().(uint64); ok {
+			meta.Modified = time.Unix(int64(ts), 0)
+		}
+	}
+
+	return meta, nil
 }
 
 // searchByServiceAndKey searches for a single item matching both the
@@ -141,7 +134,7 @@ func (c *Client) searchByServiceAndKey(ctx context.Context, collectionPath dbus.
 }
 
 // searchByService searches for all items matching a service. Returns
-// the item paths and their "username" attribute values (key names).
+// the item paths.
 func (c *Client) searchByService(ctx context.Context, collectionPath dbus.ObjectPath, service string) ([]dbus.ObjectPath, error) {
 	attrs := map[string]string{
 		"service": service,

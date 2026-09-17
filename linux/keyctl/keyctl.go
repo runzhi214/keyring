@@ -56,19 +56,35 @@ func (b *Backend) Get(_ context.Context, service, key string) (core.Secret, erro
 		}
 		return core.Secret{}, fmt.Errorf("keyctl search: %w", err)
 	}
-	n, err := unix.KeyctlBuffer(unix.KEYCTL_READ, id, nil, 0)
-	if err != nil {
-		return core.Secret{}, fmt.Errorf("keyctl read (probe): %w", err)
+	// Loop to handle TOCTOU: the key's payload may change between the
+	// probe (nil buffer) and the read (allocated buffer). If the second
+	// read returns more bytes than the buffer, retry with a larger buffer.
+	var val string
+	for {
+		n, err := unix.KeyctlBuffer(unix.KEYCTL_READ, id, nil, 0)
+		if err != nil {
+			return core.Secret{}, fmt.Errorf("keyctl read (probe): %w", err)
+		}
+		if n == 0 {
+			val = ""
+			break
+		}
+		buf := make([]byte, n)
+		read, err := unix.KeyctlBuffer(unix.KEYCTL_READ, id, buf, 0)
+		if err != nil {
+			return core.Secret{}, fmt.Errorf("keyctl read: %w", err)
+		}
+		if read <= n {
+			val = string(buf[:read])
+			break
+		}
+		// Payload grew between probe and read; loop will re-probe.
 	}
-	buf := make([]byte, n)
-	if _, err := unix.KeyctlBuffer(unix.KEYCTL_READ, id, buf, 0); err != nil {
-		return core.Secret{}, fmt.Errorf("keyctl read: %w", err)
-	}
-	val, err := b64Decode(string(buf))
+	decoded, err := b64Decode(val)
 	if err != nil {
 		return core.Secret{}, fmt.Errorf("keyctl decode: %w", err)
 	}
-	return core.Secret{Value: val}, nil
+	return core.Secret{Value: decoded}, nil
 }
 
 func (b *Backend) Set(_ context.Context, service, key string, s core.Secret) error {

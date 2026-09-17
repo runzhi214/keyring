@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	dbus "github.com/godbus/dbus/v5"
 	"github.com/runzhi214/keyring/core"
 )
 
@@ -14,7 +15,8 @@ import (
 //
 // Secrets are stored with "service" and "username" attributes, enabling
 // search by either service+key or service alone. Metadata (Label,
-// Attributes, Created, Modified) is read from item properties.
+// Attributes, Created, Modified) is read from item properties in a
+// single GetAll D-Bus call.
 //
 // The D-Bus connection is a process-level singleton (see Client). New
 // returns a lightweight struct; the connection is established lazily on
@@ -37,63 +39,97 @@ func (b *Backend) Available() core.Availability {
 	return Available()
 }
 
-func (b *Backend) Get(ctx context.Context, service, key string) (core.Secret, error) {
+// prepare returns a ready collection path for the operation. It ensures
+// the D-Bus connection is live and the collection path is resolved.
+// It does NOT check or unlock the collection — operations use the
+// optimistic pattern (try directly, retry with unlock on locked error).
+func (b *Backend) prepare(ctx context.Context) (dbus.ObjectPath, error) {
 	if err := b.client.ensureInit(); err != nil {
-		return core.Secret{}, err
+		return "", err
 	}
-
 	collectionPath, err := b.client.resolveCollection()
 	if err != nil {
-		return core.Secret{}, fmt.Errorf("resolve collection: %w", err)
+		return "", fmt.Errorf("resolve collection: %w", err)
 	}
-	if err := b.client.ensureUnlocked(ctx, collectionPath); err != nil {
-		return core.Secret{}, err
-	}
+	return collectionPath, nil
+}
 
-	itemPath, err := b.client.searchByServiceAndKey(ctx, collectionPath, service, key)
+func (b *Backend) Get(ctx context.Context, service, key string) (core.Secret, error) {
+	collectionPath, err := b.prepare(ctx)
 	if err != nil {
 		return core.Secret{}, err
 	}
 
-	secret, err := b.client.getSecret(ctx, itemPath)
-	if err != nil {
-		return core.Secret{}, err
+	result, err := b.tryGet(ctx, collectionPath, service, key)
+	if err == nil {
+		return result, nil
 	}
 
-	result := core.Secret{Value: string(secret.Value)}
-
-	if label, err := b.client.getItemLabel(itemPath); err == nil {
-		result.Label = label
-	}
-	if attrs, err := b.client.getItemAttributes(itemPath); err == nil {
-		result.Attributes = attrs
-	}
-	if created, err := b.client.getItemCreated(itemPath); err == nil {
-		result.Created = created
-	}
-	if modified, err := b.client.getItemModified(itemPath); err == nil {
-		result.Modified = modified
+	if isLockedError(err) {
+		if unlockErr := b.client.ensureUnlocked(ctx, collectionPath, service, key); unlockErr != nil {
+			return core.Secret{}, unlockErr
+		}
+		return b.tryGet(ctx, collectionPath, service, key)
 	}
 
-	return result, nil
+	return core.Secret{}, err
+}
+
+func (b *Backend) tryGet(ctx context.Context, collectionPath dbus.ObjectPath, service, key string) (core.Secret, error) {
+	var result core.Secret
+
+	err := b.client.withConn(func() error {
+		itemPath, err := b.client.searchByServiceAndKey(ctx, collectionPath, service, key)
+		if err != nil {
+			return err
+		}
+
+		secret, err := b.client.getSecret(ctx, itemPath)
+		if err != nil {
+			return err
+		}
+		result.Value = string(secret.Value)
+
+		meta, err := b.client.getItemMetadata(itemPath)
+		if err != nil {
+			return nil
+		}
+		result.Label = meta.Label
+		result.Attributes = meta.Attributes
+		result.Created = meta.Created
+		result.Modified = meta.Modified
+		return nil
+	})
+
+	return result, err
 }
 
 func (b *Backend) Set(ctx context.Context, service, key string, s core.Secret) error {
 	if s.Value == "" {
 		return core.ErrEmptyValue
 	}
-	if err := b.client.ensureInit(); err != nil {
-		return err
-	}
 
-	collectionPath, err := b.client.resolveCollection()
+	collectionPath, err := b.prepare(ctx)
 	if err != nil {
-		return fmt.Errorf("resolve collection: %w", err)
-	}
-	if err := b.client.ensureUnlocked(ctx, collectionPath); err != nil {
 		return err
 	}
 
+	err = b.trySet(ctx, collectionPath, service, key, s)
+	if err == nil {
+		return nil
+	}
+
+	if isLockedError(err) {
+		if unlockErr := b.client.ensureUnlocked(ctx, collectionPath, service, key); unlockErr != nil {
+			return unlockErr
+		}
+		return b.trySet(ctx, collectionPath, service, key, s)
+	}
+
+	return err
+}
+
+func (b *Backend) trySet(ctx context.Context, collectionPath dbus.ObjectPath, service, key string, s core.Secret) error {
 	label := s.Label
 	if label == "" {
 		label = key + " on " + service
@@ -109,63 +145,92 @@ func (b *Backend) Set(ctx context.Context, service, key string, s core.Secret) e
 		}
 	}
 
-	return b.client.createItem(ctx, collectionPath, label, attrs, s.Value)
+	return b.client.withConn(func() error {
+		return b.client.createItem(ctx, collectionPath, label, attrs, s.Value, service, key)
+	})
 }
 
 func (b *Backend) Delete(ctx context.Context, service, key string) error {
-	if err := b.client.ensureInit(); err != nil {
+	collectionPath, err := b.prepare(ctx)
+	if err != nil {
 		return err
 	}
 
-	collectionPath, err := b.client.resolveCollection()
-	if err != nil {
-		return fmt.Errorf("resolve collection: %w", err)
-	}
-	if err := b.client.ensureUnlocked(ctx, collectionPath); err != nil {
-		return err
+	err = b.tryDelete(ctx, collectionPath, service, key)
+	if err == nil {
+		return nil
 	}
 
-	itemPath, err := b.client.searchByServiceAndKey(ctx, collectionPath, service, key)
-	if err != nil {
-		var nfe *core.NotFoundError
-		if errors.As(err, &nfe) {
-			return nil
+	var nfe *core.NotFoundError
+	if errors.As(err, &nfe) {
+		return nil
+	}
+
+	if isLockedError(err) {
+		if unlockErr := b.client.ensureUnlocked(ctx, collectionPath, service, key); unlockErr != nil {
+			return unlockErr
 		}
-		return err
+		return b.tryDelete(ctx, collectionPath, service, key)
 	}
 
-	return b.client.deleteItem(ctx, itemPath)
+	return err
+}
+
+func (b *Backend) tryDelete(ctx context.Context, collectionPath dbus.ObjectPath, service, key string) error {
+	return b.client.withConn(func() error {
+		itemPath, err := b.client.searchByServiceAndKey(ctx, collectionPath, service, key)
+		if err != nil {
+			return err
+		}
+		return b.client.deleteItem(ctx, itemPath, service, key)
+	})
 }
 
 func (b *Backend) List(ctx context.Context, service string) ([]string, error) {
-	if err := b.client.ensureInit(); err != nil {
-		return nil, err
-	}
-
-	collectionPath, err := b.client.resolveCollection()
-	if err != nil {
-		return nil, fmt.Errorf("resolve collection: %w", err)
-	}
-	if err := b.client.ensureUnlocked(ctx, collectionPath); err != nil {
-		return nil, err
-	}
-
-	itemPaths, err := b.client.searchByService(ctx, collectionPath, service)
+	collectionPath, err := b.prepare(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	keys, err := b.tryList(ctx, collectionPath, service)
+	if err == nil {
+		return keys, nil
+	}
+
+	if isLockedError(err) {
+		if unlockErr := b.client.ensureUnlocked(ctx, collectionPath, service, ""); unlockErr != nil {
+			return nil, unlockErr
+		}
+		return b.tryList(ctx, collectionPath, service)
+	}
+
+	return nil, err
+}
+
+func (b *Backend) tryList(ctx context.Context, collectionPath dbus.ObjectPath, service string) ([]string, error) {
 	var keys []string
-	for _, itemPath := range itemPaths {
-		attrs, err := b.client.getItemAttributes(itemPath)
+
+	err := b.client.withConn(func() error {
+		itemPaths, err := b.client.searchByService(ctx, collectionPath, service)
 		if err != nil {
-			continue
+			return err
 		}
-		if username, ok := attrs["username"]; ok {
-			keys = append(keys, username)
+
+		for _, itemPath := range itemPaths {
+			meta, err := b.client.getItemMetadata(itemPath)
+			if err != nil {
+				continue
+			}
+			if meta.Attributes != nil {
+				if username, ok := meta.Attributes["username"]; ok {
+					keys = append(keys, username)
+				}
+			}
 		}
-	}
-	return keys, nil
+		return nil
+	})
+
+	return keys, err
 }
 
 func (b *Backend) Persistence() core.Persistence {

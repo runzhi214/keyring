@@ -3,6 +3,7 @@
 package secretservice
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -15,11 +16,14 @@ const (
 	ssIface         = "org.freedesktop.Secret.Service"
 	collectionIface = "org.freedesktop.Secret.Collection"
 	itemIface       = "org.freedesktop.Secret.Item"
-	sessionIface    = "org.freedesktop.Secret.Session"
 	promptIface     = "org.freedesktop.Secret.Prompt"
 
 	loginAlias     = "/org/freedesktop/secrets/aliases/default"
 	collectionBase = "/org/freedesktop/secrets/collection/"
+
+	// errLocked is the D-Bus error name returned by Secret Service when
+	// an item or collection is locked.
+	errLockedName = "org.freedesktop.Secret.Error.IsLocked"
 )
 
 // ssSecret is the D-Bus struct for org.freedesktop.Secret.Item's secret
@@ -35,19 +39,27 @@ type ssSecret struct {
 // session are established lazily on first use and reused for all
 // subsequent operations.
 //
-// If the connection drops (e.g. the D-Bus daemon restarts), the next
-// ensureInit call detects the break and reconnects transparently.
+// The resolved collection path is cached after the first successful
+// resolveCollection call — it is a D-Bus object path that does not change
+// during a process lifetime. The locked/unlocked state is NOT cached:
+// operations use an optimistic approach (try directly, retry with unlock
+// on locked error) to stay correct when the keyring is locked or
+// re-locked mid-session.
 //
-// The connection is never closed explicitly; it is released when the
-// process exits. This avoids the overhead of reconnecting per call
-// (which is what zalando/go-keyring does) and is safe because the
-// Secret Service daemon outlives any single client process.
+// If the D-Bus connection drops (e.g. the daemon restarts), the next
+// ensureInit call detects the break, reconnects, and clears the cached
+// collection path so it is re-resolved on the new connection.
+//
+// Concurrency: ensureInit holds a write lock (c.mu); all D-Bus operations
+// run under a read lock (c.mu.RLock) obtained by withConn. This ensures
+// that a reconnect does not race with in-flight operations.
 type Client struct {
-	mu      sync.Mutex
-	conn    *dbus.Conn
-	object  dbus.BusObject
-	session dbus.ObjectPath
-	ready   bool
+	mu             sync.RWMutex
+	conn           *dbus.Conn
+	object         dbus.BusObject
+	session        dbus.ObjectPath
+	ready          bool
+	collectionPath dbus.ObjectPath
 }
 
 var (
@@ -64,7 +76,7 @@ func sharedClient() *Client {
 }
 
 // init connects to the D-Bus session bus and opens a Secret Service
-// session. Must be called with c.mu held.
+// session. Must be called with c.mu held (write lock).
 func (c *Client) init() error {
 	conn, err := dbus.SessionBus()
 	if err != nil {
@@ -81,11 +93,13 @@ func (c *Client) init() error {
 	}
 	c.session = sessionPath
 	c.ready = true
+	c.collectionPath = ""
 	return nil
 }
 
 // ensureInit guarantees that the client is connected and has a session.
-// If the connection has dropped, it reconnects transparently.
+// If the connection has dropped, it reconnects transparently and clears
+// the cached collection path.
 // Safe to call from any goroutine.
 func (c *Client) ensureInit() error {
 	c.mu.Lock()
@@ -95,16 +109,34 @@ func (c *Client) ensureInit() error {
 		return nil
 	}
 	c.ready = false
+	c.collectionPath = ""
 	return c.init()
 }
 
+// withConn acquires a read lock and invokes fn with the client's
+// connection state. The read lock ensures that no reconnect happens
+// during the operation. The caller must have called ensureInit first.
+func (c *Client) withConn(fn func() error) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return fn()
+}
+
 // connObject returns a BusObject for the given path on the Secret Service.
+// Must be called under withConn's read lock or after ensureInit.
 func (c *Client) connObject(path dbus.ObjectPath) dbus.BusObject {
 	return c.conn.Object(ssServiceName, path)
 }
 
-// connObj returns the underlying conn and service object for direct
-// access. Must only be called after ensureInit has succeeded.
-func (c *Client) busObject() dbus.BusObject {
-	return c.object
+// isLockedError reports whether a D-Bus error indicates a locked item
+// or collection.
+func isLockedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dbusErr dbus.Error
+	if !errors.As(err, &dbusErr) {
+		return false
+	}
+	return dbusErr.Name == errLockedName
 }

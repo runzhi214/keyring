@@ -24,9 +24,13 @@ const promptTimeout = 30 * time.Second
 // A promptTimeout guard prevents indefinite blocking when the daemon
 // is running but no user is present to dismiss the dialog.
 //
+// The service and key parameters are used to populate typed errors
+// (PromptDismissedError, LockedError) so callers can identify which
+// operation triggered the prompt.
+//
 // This is the critical improvement over zalando/go-keyring, which blocks
 // indefinitely on <-promptSignal with no timeout or context awareness.
-func (c *Client) handlePrompt(ctx context.Context, promptPath dbus.ObjectPath) error {
+func (c *Client) handlePrompt(ctx context.Context, promptPath dbus.ObjectPath, service, key string) error {
 	if promptPath == "/" {
 		return nil
 	}
@@ -66,7 +70,7 @@ func (c *Client) handlePrompt(ctx context.Context, promptPath dbus.ObjectPath) e
 			return fmt.Errorf("prompt signal body[0] is %T, want bool", sig.Body[0])
 		}
 		if dismissed {
-			return &core.PromptDismissedError{Service: "", Key: ""}
+			return &core.PromptDismissedError{Service: service, Key: key}
 		}
 		return nil
 
@@ -75,7 +79,8 @@ func (c *Client) handlePrompt(ctx context.Context, promptPath dbus.ObjectPath) e
 
 	case <-timer.C:
 		return &core.LockedError{
-			Detail: "prompt timed out after " + promptTimeout.String(),
+			Service: service,
+			Detail:  "prompt timed out after " + promptTimeout.String(),
 		}
 	}
 }

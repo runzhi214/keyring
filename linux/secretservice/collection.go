@@ -9,10 +9,36 @@ import (
 	dbus "github.com/godbus/dbus/v5"
 )
 
-// resolveCollection returns the default collection (alias "default",
-// typically pointing to "login"). It first tries the alias path, then
-// falls back to the named "login" collection.
+// resolveCollection returns the default collection path, using a cached
+// value when available. The collection path is a D-Bus object path that
+// does not change during a process lifetime, so caching is safe.
+//
+// Resolution order: alias "default" → named "login" → first available
+// collection in the Collections property.
 func (c *Client) resolveCollection() (dbus.ObjectPath, error) {
+	c.mu.RLock()
+	if c.collectionPath != "" {
+		p := c.collectionPath
+		c.mu.RUnlock()
+		return p, nil
+	}
+	c.mu.RUnlock()
+
+	path, err := c.resolveCollectionUncached()
+	if err != nil {
+		return "", err
+	}
+
+	c.mu.Lock()
+	c.collectionPath = path
+	c.mu.Unlock()
+
+	return path, nil
+}
+
+// resolveCollectionUncached queries the D-Bus Collections property and
+// selects the best available collection.
+func (c *Client) resolveCollectionUncached() (dbus.ObjectPath, error) {
 	aliasPath := dbus.ObjectPath(loginAlias)
 	prop, err := c.connObject(ssServicePath).GetProperty(ssIface + ".Collections")
 	if err != nil {
@@ -21,6 +47,9 @@ func (c *Client) resolveCollection() (dbus.ObjectPath, error) {
 	paths, ok := prop.Value().([]dbus.ObjectPath)
 	if !ok {
 		return "", fmt.Errorf("Collections property is %T, want []dbus.ObjectPath", prop.Value())
+	}
+	if len(paths) == 0 {
+		return "", fmt.Errorf("no collections available")
 	}
 
 	for _, p := range paths {
@@ -36,45 +65,37 @@ func (c *Client) resolveCollection() (dbus.ObjectPath, error) {
 		}
 	}
 
-	return "", fmt.Errorf("no default or login collection found")
-}
-
-// isLocked reports whether a collection is locked.
-func (c *Client) isLocked(collectionPath dbus.ObjectPath) (bool, error) {
-	prop, err := c.connObject(collectionPath).GetProperty(collectionIface + ".Locked")
-	if err != nil {
-		return false, fmt.Errorf("read Locked property: %w", err)
-	}
-	locked, ok := prop.Value().(bool)
-	if !ok {
-		return false, fmt.Errorf("Locked property is %T, want bool", prop.Value())
-	}
-	return locked, nil
+	return paths[0], nil
 }
 
 // unlock attempts to unlock a collection. If the Secret Service returns
 // a prompt path, handlePrompt is called with the provided context.
-func (c *Client) unlock(ctx context.Context, collectionPath dbus.ObjectPath) error {
+func (c *Client) unlock(ctx context.Context, collectionPath dbus.ObjectPath, service, key string) error {
 	var unlocked []dbus.ObjectPath
 	var promptPath dbus.ObjectPath
 	if err := c.object.CallWithContext(ctx, ssIface+".Unlock", 0, []dbus.ObjectPath{collectionPath}).Store(&unlocked, &promptPath); err != nil {
 		return fmt.Errorf("unlock call: %w", err)
 	}
-	if err := c.handlePrompt(ctx, promptPath); err != nil {
+	if err := c.handlePrompt(ctx, promptPath, service, key); err != nil {
 		return err
 	}
 	return nil
 }
 
-// ensureUnlocked checks whether the collection is locked and unlocks it
-// if needed, using the provided context for prompt cancellation.
-func (c *Client) ensureUnlocked(ctx context.Context, collectionPath dbus.ObjectPath) error {
-	locked, err := c.isLocked(collectionPath)
+// ensureUnlocked explicitly checks the Locked property and unlocks if
+// needed. This is used as a fallback when an operation fails with a
+// locked error (optimistic execution pattern).
+func (c *Client) ensureUnlocked(ctx context.Context, collectionPath dbus.ObjectPath, service, key string) error {
+	prop, err := c.connObject(collectionPath).GetProperty(collectionIface + ".Locked")
 	if err != nil {
-		return err
+		return fmt.Errorf("read Locked property: %w", err)
+	}
+	locked, ok := prop.Value().(bool)
+	if !ok {
+		return fmt.Errorf("Locked property is %T, want bool", prop.Value())
 	}
 	if !locked {
 		return nil
 	}
-	return c.unlock(ctx, collectionPath)
+	return c.unlock(ctx, collectionPath, service, key)
 }
