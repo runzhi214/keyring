@@ -2,9 +2,17 @@
 
 package keyring
 
-func openDefault() (Backend, error) {
-	return nil, &UnavailableError{
-		Reason: ReasonUnsupportedPlatform,
-		Detail: "Linux backends not yet implemented",
+import (
+	"github.com/runzhi214/keyring/core"
+	"github.com/runzhi214/keyring/linux/keyctl"
+)
+
+func openDefault() (core.Backend, error) {
+	if kt := keyctl.New(); kt.Available().OK {
+		return kt, nil
+	}
+	return nil, &core.UnavailableError{
+		Reason: core.ReasonUnsupportedPlatform,
+		Detail: "no kernel keyring available on this Linux system",
 	}
 }
